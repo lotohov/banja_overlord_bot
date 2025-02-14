@@ -202,31 +202,37 @@ class BotApp:
             )
             return bool(self.outer.db.cursor.fetchone())
 
-        async def _process_registration(self, user_id: int, event: tuple, count: int) -> bool:
+        async def _process_registration(self, user_id: int, username: str, full_name: str, event: tuple, count: int) -> bool:
             try:
-                event_date = datetime.strptime(event[1].split('.')[0], "%Y-%m-%d %H:%M:%S")
+                event_date = datetime.strptime(event[1].split('.')[0], DATE_FORMAT)
             except ValueError as e:
                 logger.error(f"Error parsing event date: {e}")
                 return False
+
             current_time = datetime.now()
             is_golden = count >= self.outer.MAX_PARTICIPANTS or current_time >= (event_date - timedelta(days=3))
 
-            if is_golden:
+            try:
+                if is_golden:
+                    self.outer.db.cursor.execute(
+                        'INSERT INTO golden_stats (user_id, event_id) VALUES (?, ?)',
+                        (user_id, event[0])
+                    )
+
                 self.outer.db.cursor.execute(
-                    'INSERT INTO golden_stats (user_id, event_id) VALUES (?, ?)',
+                    'INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)',
+                    (user_id, username, full_name)
+                )
+                self.outer.db.cursor.execute(
+                    '''INSERT INTO registrations (user_id, event_id, reg_time)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)''',
                     (user_id, event[0])
                 )
+                self.outer.db.conn.commit()
+            except sqlite3.DatabaseError as e:
+                logger.error(f"Database error during registration: {e}")
+                return False
 
-            self.outer.db.cursor.execute(
-                'INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)',
-                (user_id, username, full_name)
-            )
-            self.outer.db.cursor.execute(
-                '''INSERT INTO registrations (user_id, event_id, reg_time)
-                VALUES (?, ?, CURRENT_TIMESTAMP)''',
-                (user_id, event[0])
-            )
-            self.outer.db.conn.commit()
             return is_golden
 
         def _build_success_message(self, is_golden: bool, count: int) -> str:
