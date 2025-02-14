@@ -19,6 +19,8 @@ from telegram.ext import (
 
 load_dotenv()
 
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 # Настройка логгера
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -181,7 +183,7 @@ class BotApp:
             if self._is_already_registered(user_id, event[0]):
                 return False, "Вы уже зарегистрированы", False
 
-            is_golden = await self._process_registration(user_id, event, count)
+            is_golden = await self._process_registration(user_id, username, full_name, event, count)
             return True, self._build_success_message(is_golden, count), is_golden
 
         def _get_current_event(self):
