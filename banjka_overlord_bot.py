@@ -240,20 +240,9 @@ class BotApp:
             current_time = datetime.now()
             is_golden = count >= self.outer.MAX_PARTICIPANTS or current_time >= (event_date - timedelta(days=3))
 
-            try:
-                if is_golden:
-                    self.outer.db.cursor.execute(
-                        'INSERT INTO golden_stats (user_id, event_id) VALUES (?, ?)',
-                        (user_id, event[0])
-                    )
-
+            if is_golden:
                 self.outer.db.cursor.execute(
-                    'INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)',
-                    (user_id, username, full_name)
-                )
-                self.outer.db.cursor.execute(
-                    '''INSERT INTO registrations (user_id, event_id, reg_time)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)''',
+                    'INSERT INTO golden_stats (user_id, event_id) VALUES (?, ?)',
                     (user_id, event[0])
                 )
                 self.outer.db.conn.commit()
