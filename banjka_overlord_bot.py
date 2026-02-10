@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from telegram import Update, Bot, ReplyKeyboardMarkup, KeyboardButton, ChatMember
+from telegram.error import InvalidToken
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -19,14 +21,23 @@ from telegram.ext import (
 
 load_dotenv()
 
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 # Настройка логгера
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-handler = RotatingFileHandler(
-    'bot.log', maxBytes=1024*1024, backupCount=5, encoding='utf-8'
-)
+log_path = os.getenv("LOG_PATH", "bot.log")
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+try:
+    handler = RotatingFileHandler(
+        log_path, maxBytes=1024*1024, backupCount=5, encoding='utf-8'
+    )
+except OSError:
+    fallback_path = "/tmp/banjka_overlord_bot.log"
+    handler = RotatingFileHandler(
+        fallback_path, maxBytes=1024*1024, backupCount=5, encoding='utf-8'
+    )
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
@@ -36,7 +47,8 @@ logger.addHandler(console)
 
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect('sauna.db', check_same_thread=False)
+        db_path = os.getenv("DATABASE_PATH", "banja.db")
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self._init_tables()
     
@@ -89,12 +101,26 @@ class BotApp:
     def __init__(self):
         self.db = Database()
         self.scheduler = AsyncIOScheduler()
-        self.application = ApplicationBuilder().token(os.getenv("TELEGRAM_TOKEN")).build()
-        self.bot = Bot(os.getenv("TELEGRAM_TOKEN"))
+        proxy_url = os.getenv("PROXY_URL")
+        request = HTTPXRequest(
+            connect_timeout=10,
+            read_timeout=30,
+            write_timeout=30,
+            pool_timeout=10,
+            proxy_url=proxy_url,
+        )
+        self.application = (
+            ApplicationBuilder()
+            .token(os.getenv("TELEGRAM_TOKEN"))
+            .request(request)
+            .build()
+        )
+        self.bot = Bot(os.getenv("TELEGRAM_TOKEN"), request=request)
         self.CHANNEL_ID = os.getenv("CHANNEL_ID")
         self.MAX_PARTICIPANTS = int(os.getenv("MAX_PARTICIPANTS", 20))
         self.CLOSE_AT = int(os.getenv("CLOSE_AT", 25))
         self._register_handlers()
+        logger.info("Bot initialized and handlers registered")
 
     class EventManager:
         def __init__(self, outer):
@@ -181,7 +207,9 @@ class BotApp:
             if self._is_already_registered(user_id, event[0]):
                 return False, "Вы уже зарегистрированы", False
 
-            is_golden = await self._process_registration(user_id, event, count)
+            is_golden = await self._process_registration(user_id, username, full_name, event, count)
+            if is_golden is None:
+                return False, "Ошибка регистрации", False
             return True, self._build_success_message(is_golden, count), is_golden
 
         def _get_current_event(self):
@@ -202,8 +230,13 @@ class BotApp:
             )
             return bool(self.outer.db.cursor.fetchone())
 
-        async def _process_registration(self, user_id: int, event: tuple, count: int) -> bool:
-            event_date = datetime.strptime(event[1].split('.')[0], "%Y-%m-%d %H:%M:%S")
+        async def _process_registration(self, user_id: int, username: str, full_name: str, event: tuple, count: int) -> Optional[bool]:
+            try:
+                event_date = datetime.strptime(event[1].split('.')[0], DATE_FORMAT)
+            except ValueError as e:
+                logger.error(f"Error parsing event date: {e}")
+                return None
+
             current_time = datetime.now()
             is_golden = count >= self.outer.MAX_PARTICIPANTS or current_time >= (event_date - timedelta(days=3))
 
@@ -212,17 +245,11 @@ class BotApp:
                     'INSERT INTO golden_stats (user_id, event_id) VALUES (?, ?)',
                     (user_id, event[0])
                 )
+                self.outer.db.conn.commit()
+            except sqlite3.DatabaseError as e:
+                logger.error(f"Database error during registration: {e}")
+                return None
 
-            self.outer.db.cursor.execute(
-                'INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)',
-                (user_id, username, full_name)
-            )
-            self.outer.db.cursor.execute(
-                '''INSERT INTO registrations (user_id, event_id, reg_time)
-                VALUES (?, ?, CURRENT_TIMESTAMP)''',
-                (user_id, event[0])
-            )
-            self.outer.db.conn.commit()
             return is_golden
 
         def _build_success_message(self, is_golden: bool, count: int) -> str:
@@ -270,6 +297,7 @@ class BotApp:
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message))
 
     async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info("Received /start from user_id=%s chat_id=%s", update.effective_user.id, update.effective_chat.id)
         await update.message.reply_text(
             "Добро пожаловать в банный клуб!\nИспользуйте + или кнопку ✨ Записаться",
             reply_markup=self.KEYBOARD
@@ -311,6 +339,7 @@ class BotApp:
 
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
+        logger.info("Received message '%s' from user_id=%s chat_id=%s", text, update.effective_user.id, update.effective_chat.id)
         if text in ("+", "✨ Записаться"):
             await self._handle_register(update)
         elif text == "📊 Статистика":
@@ -373,28 +402,49 @@ class BotApp:
         await self.application.initialize()
         await self.application.start()
         await self.application.updater.start_polling()
+        logger.info("Polling started")
 
         while True:
             await asyncio.sleep(3600)
 
     async def shutdown(self):
-        await self.application.updater.stop()
-        await self.application.stop()
-        await self.application.shutdown()
-        self.scheduler.shutdown()
-        self.db.close()
+        try:
+            await self.application.updater.stop()
+        except RuntimeError:
+            pass
+        try:
+            await self.application.stop()
+        except RuntimeError:
+            pass
+        try:
+            await self.application.shutdown()
+        except RuntimeError:
+            pass
+        try:
+            self.scheduler.shutdown()
+        except Exception:
+            pass
+        try:
+            self.db.close()
+        except Exception:
+            pass
 
 async def main():
-    bot = BotApp()
-    try:
-        await bot.run()
-    except (KeyboardInterrupt, SystemExit):
-        await bot.shutdown()
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}", exc_info=True)
-        await bot.shutdown()
-        await asyncio.sleep(10)
-        await main()
+    while True:
+        bot = BotApp()
+        try:
+            await bot.run()
+            return
+        except (KeyboardInterrupt, SystemExit):
+            await bot.shutdown()
+            return
+        except Exception as e:
+            if isinstance(e, InvalidToken):
+                logger.error("Критическая ошибка: неверный TELEGRAM_TOKEN")
+            else:
+                logger.error(f"Критическая ошибка: {e}", exc_info=True)
+            await bot.shutdown()
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,0 +1,17 @@
+services:
+  sauna-bot:
+    image: python:3.9-slim
+    container_name: sauna-bot
+    restart: unless-stopped
+    volumes:
+      - ./:/app
+      - sauna-data:/app/data
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      - DATABASE_PATH=/app/data/banja.db
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && python banjka_overlord_bot.py"
+
+volumes:
+  sauna-data:

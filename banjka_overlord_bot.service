@@ -1,0 +1,17 @@
+[Unit]
+Description = <Your service description here>
+After = network.target # Assuming you want to start after network interfaces are made available
+ 
+[Service]
+Type = simple
+WorkingDirectory = /home/lotohov/docker/banjka_overlord_bot
+ExecStart = /home/lotohov/docker/banjka_overlord_bot/.venv/bin/python /home/lotohov/docker/banjka_overlord_bot/banjka_overlord_bot.py
+User = # User to run the script as
+Group = # Group to run the script as
+Restart = on-failure # Restart when there are errors
+SyslogIdentifier = <Name of logs for the service>
+RestartSec = 5
+TimeoutStartSec = infinity
+ 
+[Install]
+WantedBy = multi-user.target 
