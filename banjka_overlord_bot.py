@@ -337,8 +337,7 @@ class BotApp:
                     (user_id, username, full_name)
                 )
                 self.outer.db.cursor.execute(
-                    '''INSERT INTO registrations (user_id, event_id, reg_time)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)''',
+                    'INSERT INTO golden_stats (user_id, event_id) VALUES (?, ?)',
                     (user_id, event[0])
                 )
                 self.outer.db.conn.commit()
