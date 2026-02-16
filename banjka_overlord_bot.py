@@ -5,6 +5,7 @@ import sqlite3
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -45,6 +46,7 @@ console = logging.StreamHandler()
 console.setFormatter(formatter)
 logger.addHandler(console)
 
+# Слой хранения: инициализация SQLite и миграции схемы.
 class Database:
     def __init__(self):
         db_path = os.getenv("DATABASE_PATH", "banja.db")
@@ -52,6 +54,7 @@ class Database:
         self.cursor = self.conn.cursor()
         self._init_tables()
     
+    # Создаёт базовые таблицы, если они ещё не существуют.
     def _init_tables(self):
         tables = [
             '''CREATE TABLE IF NOT EXISTS events (
@@ -90,6 +93,7 @@ class Database:
         self._migrate_golden_stats()
         self.conn.commit()
 
+    # Мягкая миграция legacy-схемы golden_stats без потери данных.
     def _migrate_golden_stats(self):
         self.cursor.execute("PRAGMA table_info(golden_stats)")
         columns = {row[1] for row in self.cursor.fetchall()}
@@ -101,6 +105,7 @@ class Database:
     def close(self):
         self.conn.close()
 
+# Основное приложение бота: конфигурация, хендлеры и бизнес-логика.
 class BotApp:
     RUS_DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     KEYBOARD = ReplyKeyboardMarkup(
@@ -110,9 +115,12 @@ class BotApp:
         resize_keyboard=True
     )
 
+    # Инициализация зависимостей, окружения и Telegram-приложения.
     def __init__(self):
         self.db = Database()
-        self.scheduler = AsyncIOScheduler()
+        self.BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow")
+        # Все плановые уведомления считаются в этой timezone, чтобы не было сдвига из-за UTC контейнера.
+        self.scheduler = AsyncIOScheduler(timezone=ZoneInfo(self.BOT_TIMEZONE))
         proxy_url = os.getenv("PROXY_URL")
         request = HTTPXRequest(
             connect_timeout=10,
@@ -141,10 +149,12 @@ class BotApp:
         self._register_handlers()
         logger.info("Bot initialized and handlers registered")
 
+    # Управление жизненным циклом событий и плановыми уведомлениями.
     class EventManager:
         def __init__(self, outer):
             self.outer = outer
 
+        # Создаёт новое активное событие, выключая предыдущее.
         async def create_event(self, start_date: datetime, interval: int):
             self.outer.db.cursor.execute('UPDATE events SET is_active = 0')
             self.outer.db.cursor.execute(
@@ -157,6 +167,7 @@ class BotApp:
             await self._schedule_notifications(start_date, event_id, interval)
             await self._update_channel_name(start_date)
 
+        # Планирует все уведомления и автосоздание следующего события.
         async def _schedule_notifications(self, event_date: datetime, event_id: int, interval: int):
             notifications = [
                 (event_date - timedelta(days=3), "Напоминание: Мероприятие через 3 дня!"),
@@ -180,6 +191,7 @@ class BotApp:
                 args=(event_id, interval)
             )
 
+        # По завершении текущего события создаёт следующее по интервалу.
         async def _create_next_event(self, event_id: int, interval: int):
             self.outer.db.cursor.execute('SELECT next_date FROM events WHERE id = ?', (event_id,))
             result = self.outer.db.cursor.fetchone()
@@ -188,6 +200,7 @@ class BotApp:
                 new_date = next_date + timedelta(days=interval)
                 await self.create_event(new_date, interval)
 
+        # Обновляет название чата/канала под дату ближайшего события.
         async def _update_channel_name(self, event_date: datetime):
             day_of_week = self.outer.RUS_DAYS[event_date.weekday()]
             new_name = f"Банька {event_date.strftime('%d.%m')} {day_of_week} {event_date.strftime('%H:%M')}"
@@ -199,6 +212,7 @@ class BotApp:
             except Exception as e:
                 logger.error(f"Ошибка обновления названия: {e}")
 
+        # Персональные ЛС-напоминания за 1 час для участников с включённым notify_enabled.
         async def _send_hour_personal_notifications(self, event_id: int):
             self.outer.db.cursor.execute(
                 'SELECT next_date FROM events WHERE id = ?',
@@ -231,6 +245,7 @@ class BotApp:
                 except Exception as e:
                     logger.warning("Не удалось отправить ЛС user_id=%s: %s", user_id, e)
 
+        # Унифицированная отправка канал-уведомлений, включая динамические payload.
         async def send_notification(self, message: str, event_id: int):
             if message in ("LOW_FILL_2_DAYS", "LOW_FILL_1_DAY"):
                 self.outer.db.cursor.execute(
@@ -273,10 +288,12 @@ class BotApp:
             
             await self.outer.bot.send_message(self.outer.CHANNEL_ID, text)
 
+    # Регистрации, отмены, статистика и пользовательские настройки уведомлений.
     class RegistrationManager:
         def __init__(self, outer):
             self.outer = outer
 
+        # Точка входа регистрации: проверки доступа/лимитов и итоговое сообщение пользователю.
         async def register_user(self, user_id: int, username: str, full_name: str) -> Tuple[bool, str, bool]:
             event = self._get_current_event()
             if not event:
@@ -294,10 +311,12 @@ class BotApp:
                 return False, "Ошибка регистрации", False
             return True, self._build_success_message(is_golden, count), is_golden
 
+        # Возвращает текущее активное событие.
         def _get_current_event(self):
             self.outer.db.cursor.execute('SELECT * FROM events WHERE is_active = 1')
             return self.outer.db.cursor.fetchone()
 
+        # Считает количество регистраций для конкретного события.
         def _get_registration_count(self, event_id: int) -> int:
             self.outer.db.cursor.execute(
                 'SELECT COUNT(*) FROM registrations WHERE event_id = ?',
@@ -305,6 +324,7 @@ class BotApp:
             )
             return self.outer.db.cursor.fetchone()[0]
 
+        # Проверяет, есть ли у пользователя запись на это событие.
         def _is_already_registered(self, user_id: int, event_id: int) -> bool:
             self.outer.db.cursor.execute(
                 'SELECT 1 FROM registrations WHERE user_id = ? AND event_id = ?',
@@ -312,6 +332,7 @@ class BotApp:
             )
             return bool(self.outer.db.cursor.fetchone())
 
+        # Выполняет запись в БД и определяет золотой статус по текущим правилам.
         async def _process_registration(self, user_id: int, username: str, full_name: str, event: tuple, count: int) -> Optional[bool]:
             try:
                 event_date = datetime.strptime(event[1].split('.')[0], DATE_FORMAT)
@@ -319,6 +340,7 @@ class BotApp:
                 logger.error(f"Error parsing event date: {e}")
                 return None
 
+            # Золотой статус выдаётся по заполненности обычных мест или по дедлайну в часах.
             current_time = datetime.now()
             golden_by_capacity = count >= self.outer.MAX_PARTICIPANTS
             golden_by_time = current_time >= (event_date - timedelta(hours=self.outer.CANCEL_BEFORE_HOURS))
@@ -347,6 +369,7 @@ class BotApp:
 
             return is_golden
 
+        # Формирует человекочитаемое подтверждение успешной регистрации.
         def _build_success_message(self, is_golden: bool, count: int) -> str:
             message = "Регистрация успешна!"
             if is_golden:
@@ -355,6 +378,7 @@ class BotApp:
                 message += "\nВнимание: достигнут лимит участников!"
             return message
 
+        # Формирует ответ, когда регистрация закрыта, с подсказкой по открытию.
         def _build_closed_message(self, event: Optional[tuple]) -> str:
             open_cmd = "/setdate ДД.ММ.ГГГГ ЧЧ:ММ ИНТЕРВАЛ"
             if not event:
@@ -376,6 +400,7 @@ class BotApp:
                 f"Команда открытия: {open_cmd}"
             )
 
+        # Сводная статистика: посещения и количество золотых регистраций по пользователям.
         async def get_stats(self) -> List[Dict]:
             self.outer.db.cursor.execute('''
                 SELECT u.full_name, COUNT(r.id), COUNT(g.id), u.user_id
@@ -392,6 +417,7 @@ class BotApp:
                 'user_id': row[3]
             } for row in self.outer.db.cursor.fetchall()]
 
+        # Данные о ближайшем событии и списке участников для блока статистики.
         async def get_next_event_info(self) -> Dict:
             event = self._get_current_event()
             if not event:
@@ -413,6 +439,7 @@ class BotApp:
 
             return {"event_time": event_time, "participants": participants}
 
+        # Отмена записи с проверкой дедлайна и возвратом деталей для канал-уведомления.
         async def unregister_user(self, user_id: int) -> Tuple[bool, str, Optional[Dict]]:
             event = self._get_current_event()
             if not event:
@@ -457,6 +484,7 @@ class BotApp:
             }
             return True, "Регистрация отменена.", details
 
+        # Переключает персональный флаг уведомлений и возвращает новое состояние.
         async def toggle_notifications(self, user_id: int) -> bool:
             self.outer.db.cursor.execute('''
                 INSERT OR REPLACE INTO notification_settings (user_id, notify_enabled)
@@ -471,6 +499,7 @@ class BotApp:
             )
             return self.outer.db.cursor.fetchone()[0] == 1
 
+    # Регистрирует команды и обработчик текстовых сообщений.
     def _register_handlers(self):
         self.application.add_handler(CommandHandler("start", self._handle_start))
         self.application.add_handler(CommandHandler("rules", self._handle_rules))
@@ -478,6 +507,7 @@ class BotApp:
         self.application.add_handler(CommandHandler("cancel", self._handle_cancel))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message))
 
+    # Приветствие и подсказки по базовым действиям.
     async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Received /start from user_id=%s chat_id=%s", update.effective_user.id, update.effective_chat.id)
         await update.message.reply_text(
@@ -487,6 +517,7 @@ class BotApp:
             reply_markup=self.KEYBOARD
         )
 
+    # Выводит свод правил пользования банным чатом.
     async def _handle_rules(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         rules_text = (
             "‼️5 простых правила настоящих банщиков:\n"
@@ -499,6 +530,7 @@ class BotApp:
         )
         await update.message.reply_text(rules_text, reply_markup=self.KEYBOARD)
 
+    # Админ/whitelist-команда создания следующего события.
     async def _handle_set_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._can_set_date(update):
             return
@@ -525,6 +557,7 @@ class BotApp:
                 reply_markup=self.KEYBOARD
             )
 
+    # Полная отмена текущего активного события и очистка scheduler jobs.
     async def _handle_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await self._check_admin(update):
             self.db.cursor.execute('UPDATE events SET is_active = 0')
@@ -533,7 +566,9 @@ class BotApp:
             await update.message.reply_text("Мероприятие отменено", reply_markup=self.KEYBOARD)
             await self.bot.send_message(self.CHANNEL_ID, "❌ Мероприятие отменено")
 
+    # Роутер текстовых команд с клавиатуры (+, -, статистика, уведомления, правила).
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Игнорируем нетекстовые и сервисные update, чтобы не падать на None.
         if not update.message or not update.message.text:
             return
         text = update.message.text.strip()
@@ -549,6 +584,7 @@ class BotApp:
         elif text in ("Правила", "📜 Правила"):
             await self._handle_rules(update, context)
 
+    # Пользовательская регистрация и уведомление в канал о новом участнике.
     async def _handle_register(self, update: Update):
         user = update.effective_user
         reg_manager = self.RegistrationManager(self)
@@ -567,6 +603,7 @@ class BotApp:
             reply_markup=self.KEYBOARD
         )
 
+    # Пользовательская отмена и отправка деталей отмены в канал.
     async def _handle_unregister(self, update: Update):
         user = update.effective_user
         reg_manager = self.RegistrationManager(self)
@@ -591,6 +628,7 @@ class BotApp:
             reply_markup=self.KEYBOARD
         )
 
+    # Расширенный отчёт: персональная статистика + ближайшее событие и участники.
     async def _handle_stats(self, update: Update):
         reg_manager = self.RegistrationManager(self)
         stats_data = await reg_manager.get_stats()
@@ -616,6 +654,7 @@ class BotApp:
             reply_markup=self.KEYBOARD
         )
 
+    # Переключение персональных ЛС-уведомлений.
     async def _handle_notifications(self, update: Update):
         user = update.effective_user
         reg_manager = self.RegistrationManager(self)
@@ -626,6 +665,7 @@ class BotApp:
             reply_markup=self.KEYBOARD
         )
 
+    # Явная проверка админ-прав с ответом пользователю при отказе.
     async def _check_admin(self, update: Update) -> bool:
         user = await self.bot.get_chat_member(
             update.effective_chat.id,
@@ -636,6 +676,7 @@ class BotApp:
             return False
         return True
 
+    # Доступ к /setdate: админ или пользователь из whitelist.
     async def _can_set_date(self, update: Update) -> bool:
         if await self._check_admin_silent(update):
             return True
@@ -647,6 +688,7 @@ class BotApp:
         )
         return False
 
+    # Тихая проверка админ-прав без пользовательского сообщения.
     async def _check_admin_silent(self, update: Update) -> bool:
         user = await self.bot.get_chat_member(
             update.effective_chat.id,
@@ -654,6 +696,7 @@ class BotApp:
         )
         return user.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
 
+    # Запускает scheduler и long-polling Telegram API.
     async def run(self):
         self.scheduler.start()
         await self.application.initialize()
@@ -664,6 +707,7 @@ class BotApp:
         while True:
             await asyncio.sleep(3600)
 
+    # Корректно останавливает polling, scheduler и соединение с БД.
     async def shutdown(self):
         try:
             await self.application.updater.stop()
@@ -686,6 +730,7 @@ class BotApp:
         except Exception:
             pass
 
+# Основной цикл: автоперезапуск при непредвиденных ошибках.
 async def main():
     while True:
         bot = BotApp()
